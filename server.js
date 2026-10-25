@@ -64,6 +64,29 @@ async function getNews(){
   return {status:status("GDELT news index",true,iso(),null),articles};
  }catch(e){return {status:status("GDELT news index",true,null,e.message),articles:[]};}
 }
+async function getEnergy(){
+ const key=process.env.EIA_API_KEY;
+ if(!key)return {status:status("US EIA",false,null,"API key required for official weekly crude inventory data"),latest:null,observations:[]};
+ try{
+  const url="https://api.eia.gov/v2/petroleum/stoc/wstk/data/?frequency=weekly&data%5B0%5D=value&facets%5Bduoarea%5D%5B0%5D=NUS&facets%5Bproduct%5D%5B0%5D=EPC0&facets%5Bprocess%5D%5B0%5D=SAE&sort%5B0%5D%5Bcolumn%5D=period&sort%5B0%5D%5Bdirection%5D=desc&length=8&api_key="+encodeURIComponent(key);
+  const d=await getJson(url);
+  const rows=d?.response?.data;
+  if(!Array.isArray(rows))throw new Error("unexpected_EIA_schema");
+  const observations=rows.map(r=>({period:r.period,value:Number(r.value),units:r["units"]||"thousand barrels"}));
+  return {status:status("US EIA",true,iso(),null),latest:observations[0]||null,observations};
+ }catch(e){return {status:status("US EIA",true,null,e.message),latest:null,observations:[]};}
+}
+async function getFedUpdates(){
+ try{
+  const xml=await getText("https://www.federalreserve.gov/feeds/press_all.xml");
+  const items=[...xml.matchAll(/<item>([\\s\\S]*?)<\\/item>/gi)].slice(0,20).map(m=>{
+   const block=m[1];
+   const field=(tag)=>{const x=block.match(new RegExp("<"+tag+"[^>]*>([\\s\\S]*?)<\\/"+tag+">","i"));return x?x[1].replace(/<!\\[CDATA\\[|\\]\\]>/g,"").replace(/&amp;/g,"&").replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&lt;/g,"<").replace(/&gt;/g,">").trim():null;};
+   return {title:field("title"),url:field("link"),publishedAt:field("pubDate"),source:"Federal Reserve official RSS",sourceType:"official"};
+  }).filter(x=>x.title&&x.url);
+  return {status:status("Federal Reserve official RSS",true,iso(),null),articles:items};
+ }catch(e){return {status:status("Federal Reserve official RSS",true,null,e.message),articles:[]};}
+}
 async function getMacroSeries(){
  const ids=["DGS10","DFII10","DFF","DTWEXBGS","DCOILWTICO"];
  try{
@@ -116,11 +139,11 @@ function buildThesis(symbol,quote,news,calendar,macro){
  return {instrument:symbol,direction,confidence,horizon:"multi-day",dataReady:feedReady,generatedAt:iso(),reasons,risks,headlineContext:{bullishMatches:upCount,bearishMatches:downCount},note:"Watch bias is a basic keyword-plus-momentum filter, not validated AI. No orders or automatic entries are sent; WAIT remains the default unless independent feeds align."};
 }
 async function overview(){
- const [market,calendar,news,macro]=await Promise.all([getQuotes(),getCalendar(),getNews(),getMacroSeries()]);
- const bySymbol=Object.fromEntries(market.quotes.map(q=>[q.symbol,q]));
+ const [market,calendar,news,macro,energy,fed]=await Promise.all([getQuotes(),getCalendar(),getNews(),getMacroSeries(),getEnergy(),getFedUpdates()]);
+ const bySymbol=Object.fromEntries(market.quotes.map(q=>[q.symbol,q]));\n const combinedNews={...news,articles:[...(fed.articles||[]),...(news.articles||[])].sort((a,b)=>Date.parse(b.publishedAt||0)-Date.parse(a.publishedAt||0)).slice(0,35)};
  return {app:"MacroPulse",mode:"paper",liveExecution:false,startingBalance:PAPER_BALANCE,
-  instruments:[{symbol:"XAUUSD",configuredLots:0.01,quote:bySymbol.XAUUSD||null,thesis:buildThesis("XAUUSD",bySymbol.XAUUSD,news,calendar,macro)},{symbol:"USOIL",configuredLots:0.1,quote:bySymbol.USOIL||null,thesis:buildThesis("USOIL",bySymbol.USOIL,news,calendar,macro)}],
-  providers:{market:market.status,calendar:calendar.status,news:news.status,macro:macro.status},
+  instruments:[{symbol:"XAUUSD",configuredLots:0.01,quote:bySymbol.XAUUSD||null,thesis:buildThesis("XAUUSD",bySymbol.XAUUSD,combinedNews,calendar,macro)},{symbol:"USOIL",configuredLots:0.1,quote:bySymbol.USOIL||null,thesis:buildThesis("USOIL",bySymbol.USOIL,combinedNews,calendar,macro)}],
+  providers:{market:market.status,calendar:calendar.status,news:news.status,macro:macro.status,energy:energy.status,federalReserve:fed.status},
   calendar:{configured:calendar.status.configured,provider:calendar.status.provider,updatedAt:calendar.status.updatedAt,events:calendar.events,warning:calendar.status.error||(!calendar.status.configured?"Add TRADING_ECONOMICS_API_KEY to enable verified economic calendar.":null)},
   news,macro,
   paper:{balance:PAPER_BALANCE,realizedPnl:0,positions:[],notes:["Paper ledger baseline only; no P/L simulation or persistent positions are connected yet."]},
