@@ -27,9 +27,16 @@ async function getQuotes(){
  const specs=[{symbol:"XAU/USD",display:"XAUUSD",asset:"Gold spot reference"},{symbol:"WTI/USD",display:"USOIL",asset:"WTI spot reference"}];
  const results=await Promise.all(specs.map(async s=>{
   try{
-   const d=await getJson("https://api.twelvedata.com/quote?symbol="+encodeURIComponent(s.symbol)+"&apikey="+encodeURIComponent(key));
+   const [d,bars]=await Promise.all([
+    getJson("https://api.twelvedata.com/quote?symbol="+encodeURIComponent(s.symbol)+"&apikey="+encodeURIComponent(key)),
+    getJson("https://api.twelvedata.com/time_series?symbol="+encodeURIComponent(s.symbol)+"&interval=1h&outputsize=12&apikey="+encodeURIComponent(key))
+   ]);
    if(d.status==="error"||!d.close)throw new Error(d.message||"quote_unavailable");
-   return {symbol:s.display,providerSymbol:s.symbol,asset:s.asset,price:Number(d.close),open:Number(d.open)||null,high:Number(d.high)||null,low:Number(d.low)||null,change:Number(d.change)||null,percentChange:Number(d.percent_change)||null,datetime:d.datetime||d.timestamp||null,source:"Twelve Data",verified:true};
+   const values=Array.isArray(bars.values)?bars.values.slice().reverse():[];
+   const last=values.length?Number(values[values.length-1].close):null;
+   const prior=values.length>4?Number(values[values.length-5].close):null;
+   const momentumPct=last>0&&prior>0?((last-prior)/prior)*100:null;
+   return {symbol:s.display,providerSymbol:s.symbol,asset:s.asset,price:Number(d.close),open:Number(d.open)||null,high:Number(d.high)||null,low:Number(d.low)||null,change:Number(d.change)||null,percentChange:Number(d.percent_change)||null,datetime:d.datetime||d.timestamp||null,momentumPct:Number.isFinite(momentumPct)?momentumPct:null,momentumWindow:"approximately 4 hourly candles",candleTime:values.length?values[values.length-1].datetime:null,source:"Twelve Data",verified:true};
   }catch(e){return {symbol:s.display,asset:s.asset,verified:false,error:e.message};}
  }));
  return {status:status("Twelve Data",true,iso(),results.some(x=>x.verified)?null:"Quote lookup failed; verify symbols/plan"),quotes:results};
@@ -98,8 +105,15 @@ function buildThesis(symbol,quote,news,calendar,macro){
  risks.push("Reference feed symbols may differ from Exness CFD pricing/spread.");
  risks.push("No verified cross-source post-event confirmation, order book, broker contract spec or backtested edge yet.");
  const feedReady=priceOK&&news.status.available&&calendar.status.available;
- const direction="WAIT";
- return {instrument:symbol,direction,confidence:0,horizon:"multi-day",dataReady:feedReady,generatedAt:iso(),reasons,risks,headlineContext:{bullishMatches:upCount,bearishMatches:downCount},note:"Directional execution signals remain disabled until verified feeds, timestamp alignment and historical event validation are implemented."};
+ const momentum=Number(quote?.momentumPct);
+ let direction="WAIT",confidence=0;
+ if(feedReady&&Number.isFinite(momentum)&&Math.abs(momentum)>=0.08&&upCount+downCount>=2&&upCount!==downCount){
+  const momentumUp=momentum>0;
+  const newsUp=upCount>downCount;
+  if(momentumUp===newsUp){direction=momentumUp?"BULLISH WATCH":"BEARISH WATCH";confidence=55;}
+ }
+ if(Number.isFinite(momentum))reasons.push("Hourly reference-price momentum: "+momentum.toFixed(3)+"% over "+(quote.momentumWindow||"recent candles")+"; not an entry signal by itself.");
+ return {instrument:symbol,direction,confidence,horizon:"multi-day",dataReady:feedReady,generatedAt:iso(),reasons,risks,headlineContext:{bullishMatches:upCount,bearishMatches:downCount},note:"Watch bias is a basic keyword-plus-momentum filter, not validated AI. No orders or automatic entries are sent; WAIT remains the default unless independent feeds align."};
 }
 async function overview(){
  const [market,calendar,news,macro]=await Promise.all([getQuotes(),getCalendar(),getNews(),getMacroSeries()]);
@@ -113,7 +127,14 @@ async function overview(){
   monitor:{target:"24/5",active:false,note:"Web app refreshes on demand; persistent 24/5 background worker and alerts are not connected."}};
 }
 app.get("/api/health",(_req,res)=>res.json({ok:true,app:"MacroPulse",mode:"paper",liveExecution:false,time:iso()}));
-app.get("/api/overview",async(_req,res)=>{try{res.set("Cache-Control","no-store");res.json(await overview());}catch(e){res.status(503).json({error:"overview_unavailable",message:e.message,liveExecution:false});}});
+let overviewCache=null, lastRefreshError=null;
+async function refreshOverview(){
+ try{overviewCache=await overview();lastRefreshError=null;console.log("MacroPulse data refresh ok "+iso());}
+ catch(e){lastRefreshError=e.message;console.error("MacroPulse refresh failed "+e.message);}
+}
+app.get("/api/overview",async(_req,res)=>{res.set("Cache-Control","no-store");if(!overviewCache)await refreshOverview();if(overviewCache)return res.json({...overviewCache,monitor:{target:"24/5",active:true,refreshIntervalSeconds:300,lastRefreshError,note:"Server-side data polling runs every 5 minutes while the Railway service is online. This is not a guarantee of uninterrupted uptime or alert delivery."}});res.status(503).json({error:"overview_unavailable",message:lastRefreshError||"Waiting for first refresh",liveExecution:false});});
+setTimeout(()=>refreshOverview(),1000);
+setInterval(()=>refreshOverview(),300000).unref();
 app.get("/api/news",async(_req,res)=>res.json(await getNews()));
 app.get("/api/calendar",async(_req,res)=>res.json(await getCalendar()));
 app.get("/api/market",async(_req,res)=>res.json(await getQuotes()));
