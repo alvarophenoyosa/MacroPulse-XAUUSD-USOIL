@@ -6,37 +6,127 @@ const app=express(), port=Number(process.env.PORT||8080);
 const root=path.dirname(fileURLToPath(import.meta.url));
 app.use(express.json({limit:"32kb"}));
 app.use(express.static(path.join(root,"public"),{maxAge:"1h"}));
+const PAPER_BALANCE=Number(process.env.STARTING_BALANCE_USD||500);
+const timeout=()=>AbortSignal.timeout(9000);
+async function getJson(url,headers={}) {
+ const r=await fetch(url,{headers,signal:timeout()});
+ if(!r.ok) throw new Error("provider_http_"+r.status);
+ return r.json();
+}
+async function getText(url) {
+ const r=await fetch(url,{signal:timeout()});
+ if(!r.ok) throw new Error("provider_http_"+r.status);
+ return r.text();
+}
+const iso=()=>new Date().toISOString();
+function status(name,configured,updatedAt,error=null){return {provider:name,configured,available:!error&&!!updatedAt,updatedAt:updatedAt||null,error:error||null};}
 
-const calendarStatus=()=>({
-  configured:false,provider:process.env.ECONOMIC_CALENDAR_PROVIDER||"not-configured",
-  updatedAt:null,events:[],
-  warning:"No verified live calendar feed is connected. Events and news are never fabricated; directional trading stays disabled."
-});
-app.get("/api/health",(_req,res)=>res.json({ok:true,app:"MacroPulse",mode:"paper",liveExecution:false,time:new Date().toISOString()}));
-app.get("/api/overview",(_req,res)=>{
- const balance=Number(process.env.STARTING_BALANCE_USD||500), calendar=calendarStatus();
- const thesis=(symbol)=>({
-  instrument:symbol,direction:"WAIT",confidence:0,horizon:"multi-day",dataReady:false,generatedAt:new Date().toISOString(),
-  reasons:symbol==="XAUUSD"
-   ?["No verified live market/news feed is connected.","Gold thesis must combine USD, real yields, rate expectations, positioning and risk premium.","Wait for actual-versus-consensus data and post-event price confirmation."]
-   :["No verified live market/news feed is connected.","Oil thesis must combine inventories, OPEC/supply, demand, geopolitics, spreads and futures curve.","Wait for verified event data, spread checks and post-event confirmation."],
-  risks:["CPI/NFP/FOMC surprises can cause slippage, gaps and whipsaws.","Broker contract sizes, tick values, margin and trading sessions must be verified.","No live orders are enabled."]
- });
- res.json({app:"MacroPulse",mode:"paper",liveExecution:false,startingBalance:balance,
-  instruments:[{symbol:"XAUUSD",configuredLots:0.01,thesis:thesis("XAUUSD")},{symbol:"USOIL",configuredLots:0.1,thesis:thesis("USOIL")}],
-  calendar,paper:{balance,realizedPnl:0,positions:[],notes:["Paper ledger baseline only; no P/L simulation or orders are connected yet."]},
-  monitor:{target:"24/5",active:false,note:"Live worker and verified data feed are not connected."}});
-});
+async function getQuotes(){
+ const key=process.env.TWELVE_DATA_API_KEY;
+ if(!key)return {status:status("Twelve Data",false,null,"API key required for live quotes"),quotes:[]};
+ const specs=[{symbol:"XAU/USD",display:"XAUUSD",asset:"Gold spot reference"},{symbol:"WTI/USD",display:"USOIL",asset:"WTI spot reference"}];
+ const results=await Promise.all(specs.map(async s=>{
+  try{
+   const d=await getJson("https://api.twelvedata.com/quote?symbol="+encodeURIComponent(s.symbol)+"&apikey="+encodeURIComponent(key));
+   if(d.status==="error"||!d.close)throw new Error(d.message||"quote_unavailable");
+   return {symbol:s.display,providerSymbol:s.symbol,asset:s.asset,price:Number(d.close),open:Number(d.open)||null,high:Number(d.high)||null,low:Number(d.low)||null,change:Number(d.change)||null,percentChange:Number(d.percent_change)||null,datetime:d.datetime||d.timestamp||null,source:"Twelve Data",verified:true};
+  }catch(e){return {symbol:s.display,asset:s.asset,verified:false,error:e.message};}
+ }));
+ return {status:status("Twelve Data",true,iso(),results.some(x=>x.verified)?null:"Quote lookup failed; verify symbols/plan"),quotes:results};
+}
+async function getCalendar(){
+ const key=process.env.TRADING_ECONOMICS_API_KEY;
+ if(!key)return {status:status("Trading Economics",false,null,"API key required for verified actual/forecast/previous calendar"),events:[]};
+ try{
+  const d=await getJson("https://api.tradingeconomics.com/calendar?country=united%20states&importance=2,3&values=true&f=json",{Authorization:key});
+  if(!Array.isArray(d))throw new Error("unexpected_calendar_schema");
+  const now=Date.now();
+  const events=d.filter(e=>/CPI|consumer price|non.?farm|payroll|jobless|unemployment|federal funds|interest rate|FOMC|fed chair|crude oil inventories|API crude|EIA crude|OPEC|PCE|GDP|retail sales|PPI|ISM/i.test(String(e.Event||e.Category||"")))
+   .map(e=>({date:e.Date||null,country:e.Country||"United States",event:e.Event||e.Category||"Economic event",importance:Number(e.Importance)||null,actual:e.Actual??null,forecast:e.Forecast??null,previous:e.Previous??null,unit:e.Unit||"",currency:e.Currency||"",lastUpdate:e.LastUpdate||null,source:"Trading Economics",url:e.URL||null}))
+   .filter(e=>!e.date||!Number.isFinite(Date.parse(e.date))||Date.parse(e.date)>now-36*3600000)
+   .sort((a,b)=>Date.parse(a.date||0)-Date.parse(b.date||0)).slice(0,35);
+  return {status:status("Trading Economics",true,iso(),null),events};
+ }catch(e){return {status:status("Trading Economics",true,null,e.message),events:[]};}
+}
+async function getNews(){
+ const query='(gold OR crude oil OR WTI OR OPEC OR "Federal Reserve" OR FOMC OR CPI OR inflation OR "nonfarm payrolls" OR "jobless claims" OR Treasury yields OR dollar)';
+ const url="https://api.gdeltproject.org/api/v2/doc/doc?query="+encodeURIComponent(query)+"&mode=ArtList&format=json&sort=DateDesc&maxrecords=30&timespan=24h";
+ try{
+  const d=await getJson(url);
+  const articles=(d.articles||[]).map(a=>({title:a.title||"Untitled",url:a.url||null,source:a.domain||a.source||"Unknown",publishedAt:a.seendate||null,language:a.language||null,sourceType:"GDELT"})).filter(a=>a.title&&a.url).slice(0,30);
+  return {status:status("GDELT news index",true,iso(),null),articles};
+ }catch(e){return {status:status("GDELT news index",true,null,e.message),articles:[]};}
+}
+async function getMacroSeries(){
+ const ids=["DGS10","DFII10","DFF","DTWEXBGS","DCOILWTICO"];
+ try{
+  const csv=await getText("https://fred.stlouisfed.org/graph/fredgraph.csv?id="+ids.join(","));
+  const lines=csv.trim().split(/\r?\n/), headers=lines.shift().split(",");
+  const rows=lines.slice(-12).map(line=>line.split(","));
+  const latest={};
+  for(const id of ids){
+   const idx=headers.indexOf(id);
+   if(idx<0)continue;
+   for(let i=rows.length-1;i>=0;i--){const val=rows[i][idx];if(val&&val!=="."&&Number.isFinite(Number(val))){latest[id]={value:Number(val),date:rows[i][0]};break;}}
+  }
+  return {status:status("FRED public series",true,iso(),null),data:latest,disclaimer:"FRED values are daily/periodic and can be delayed; not tick-level live prices."};
+ }catch(e){return {status:status("FRED public series",true,null,e.message),data:{},disclaimer:"Macro series unavailable."};}
+}
+function buildThesis(symbol,quote,news,calendar,macro){
+ const gold=symbol==="XAUUSD", reasons=[],risks=[];
+ const priceOK=!!quote?.verified&&Number.isFinite(quote.price);
+ if(!priceOK)reasons.push("Live quote unavailable or not verified.");
+ else reasons.push("Latest reference quote: "+quote.price+" ("+quote.providerSymbol+"); source timestamp: "+(quote.datetime||"not supplied")+".");
+ const headlines=(news.articles||[]).slice(0,20).map(a=>a.title.toLowerCase());
+ const goldUp=/gold (rall|surge|rise|gain)|safe.?haven|rate cut|dovish|yield(s)? fall|dollar weak|weak dollar/;
+ const goldDown=/gold (drop|fall|slide|sink)|hawkish|rate hike|yield(s)? rise|dollar surge|strong dollar/;
+ const oilUp=/oil (surge|rise|gain|jump)|supply cut|opec.{0,25}(cut|reduce)|inventory draw|crude stocks fall|supply disruption/;
+ const oilDown=/oil (drop|fall|slide|sink)|opec.{0,25}(increase|raise)|inventory build|crude stocks rise|demand concerns/;
+ const up=gold?goldUp:oilUp, down=gold?goldDown:oilDown;
+ let upCount=0,downCount=0;
+ for(const h of headlines){if(up.test(h))upCount++;if(down.test(h))downCount++;}
+ if(upCount||downCount)reasons.push("Headline keyword scan: "+upCount+" bullish-context and "+downCount+" bearish-context matches; headlines are context, not verified causal signals.");
+ else reasons.push("No clear directional headline keyword cluster; do not infer direction from absence of news.");
+ if(gold&&macro.data?.DFII10)reasons.push("Latest 10Y TIPS real yield: "+macro.data.DFII10.value+"% ("+macro.data.DFII10.date+").");
+ if(gold&&macro.data?.DTWEXBGS)reasons.push("Broad dollar index: "+macro.data.DTWEXBGS.value+" ("+macro.data.DTWEXBGS.date+").");
+ if(gold&&macro.data?.DGS10)reasons.push("10Y Treasury yield: "+macro.data.DGS10.value+"% ("+macro.data.DGS10.date+").");
+ if(!gold&&macro.data?.DCOILWTICO)reasons.push("FRED WTI series: "+macro.data.DCOILWTICO.value+" ("+macro.data.DCOILWTICO.date+"); daily reference, not Exness CFD quote.");
+ const highImpact=(calendar.events||[]).filter(e=>e.importance>=2);
+ if(highImpact.length)reasons.push(highImpact.length+" high/medium-importance macro events in provider response; check exact release time before any simulated decision.");
+ risks.push("GDELT headline keyword scan is not a trained sentiment model and can misread context.");
+ risks.push("FRED macro series are not tick-level live and may be delayed.");
+ risks.push("Reference feed symbols may differ from Exness CFD pricing/spread.");
+ risks.push("No verified cross-source post-event confirmation, order book, broker contract spec or backtested edge yet.");
+ const feedReady=priceOK&&news.status.available&&calendar.status.available;
+ const direction="WAIT";
+ return {instrument:symbol,direction,confidence:0,horizon:"multi-day",dataReady:feedReady,generatedAt:iso(),reasons,risks,headlineContext:{bullishMatches:upCount,bearishMatches:downCount},note:"Directional execution signals remain disabled until verified feeds, timestamp alignment and historical event validation are implemented."};
+}
+async function overview(){
+ const [market,calendar,news,macro]=await Promise.all([getQuotes(),getCalendar(),getNews(),getMacroSeries()]);
+ const bySymbol=Object.fromEntries(market.quotes.map(q=>[q.symbol,q]));
+ return {app:"MacroPulse",mode:"paper",liveExecution:false,startingBalance:PAPER_BALANCE,
+  instruments:[{symbol:"XAUUSD",configuredLots:0.01,quote:bySymbol.XAUUSD||null,thesis:buildThesis("XAUUSD",bySymbol.XAUUSD,news,calendar,macro)},{symbol:"USOIL",configuredLots:0.1,quote:bySymbol.USOIL||null,thesis:buildThesis("USOIL",bySymbol.USOIL,news,calendar,macro)}],
+  providers:{market:market.status,calendar:calendar.status,news:news.status,macro:macro.status},
+  calendar:{configured:calendar.status.configured,provider:calendar.status.provider,updatedAt:calendar.status.updatedAt,events:calendar.events,warning:calendar.status.error||(!calendar.status.configured?"Add TRADING_ECONOMICS_API_KEY to enable verified economic calendar.":null)},
+  news,macro,
+  paper:{balance:PAPER_BALANCE,realizedPnl:0,positions:[],notes:["Paper ledger baseline only; no P/L simulation or persistent positions are connected yet."]},
+  monitor:{target:"24/5",active:false,note:"Web app refreshes on demand; persistent 24/5 background worker and alerts are not connected."}};
+}
+app.get("/api/health",(_req,res)=>res.json({ok:true,app:"MacroPulse",mode:"paper",liveExecution:false,time:iso()}));
+app.get("/api/overview",async(_req,res)=>{try{res.set("Cache-Control","no-store");res.json(await overview());}catch(e){res.status(503).json({error:"overview_unavailable",message:e.message,liveExecution:false});}});
+app.get("/api/news",async(_req,res)=>res.json(await getNews()));
+app.get("/api/calendar",async(_req,res)=>res.json(await getCalendar()));
+app.get("/api/market",async(_req,res)=>res.json(await getQuotes()));
 app.post("/api/paper/validate-entry",(req,res)=>{
  const b=req.body||{}, lots={XAUUSD:0.01,USOIL:0.1}, reasons=[];
  if(!Object.hasOwn(lots,b.instrument)||!["BUY","SELL"].includes(b.side))return res.status(400).json({error:"Invalid instrument or side."});
- const balance=Number(process.env.STARTING_BALANCE_USD||500);
+ const balance=PAPER_BALANCE;
  if(Number(b.lots)!==lots[b.instrument])reasons.push("Lot size does not match configured instrument size.");
  if(!(Number(b.entryPrice)>0)||!(Number(b.invalidationPrice)>0))reasons.push("Entry and invalidation prices must be positive.");
- if(!(Number(b.estimatedRiskUsd)>0))reasons.push("Risk must be estimated from verified broker contract specifications.");
- if(Number(b.estimatedRiskUsd)>balance*.01)reasons.push("Estimated risk exceeds the 1% paper per-entry cap.");
+ if(!(Number(b.estimatedRiskUsd)>0))reasons.push("Risk must be estimated from verified contract specifications.");
+ if(Number(b.estimatedRiskUsd)>balance*.01)reasons.push("Estimated risk exceeds the 1% paper per-entry cap ($"+(balance*.01).toFixed(2)+").");
  if(b.side==="BUY"&&Number(b.invalidationPrice)>=Number(b.entryPrice))reasons.push("BUY invalidation must be below entry.");
  if(b.side==="SELL"&&Number(b.invalidationPrice)<=Number(b.entryPrice))reasons.push("SELL invalidation must be above entry.");
  res.status(reasons.length?422:200).json({allowed:!reasons.length,reasons:reasons.length?reasons:["Basic checks passed only. No order was sent."]});
 });
-app.listen(port,"0.0.0.0",()=>console.log(`MacroPulse listening on ${port}; paper-only, live execution disabled`));
+app.listen(port,"0.0.0.0",()=>console.log("MacroPulse listening on "+port+"; paper-only, live execution disabled"));
