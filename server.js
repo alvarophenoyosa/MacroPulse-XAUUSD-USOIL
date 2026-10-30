@@ -132,12 +132,13 @@ function buildThesis(symbol,quote,news,calendar,macro){
 }
 async function overview(){
  const [market,calendar,news,macro,energy,fed]=await Promise.all([getQuotes(),getCalendar(),getNews(),getMacroSeries(),getEnergy(),getFedUpdates()]);
- const bySymbol=Object.fromEntries(market.quotes.map(q=>[q.symbol,q]));\n const combinedNews={...news,articles:[...(fed.articles||[]),...(news.articles||[])].sort((a,b)=>Date.parse(b.publishedAt||0)-Date.parse(a.publishedAt||0)).slice(0,35)};
+ const bySymbol=Object.fromEntries(market.quotes.map(q=>[q.symbol,q]));
+ const combinedNews={...news,articles:[...(fed.articles||[]),...(news.articles||[])].sort((a,b)=>Date.parse(b.publishedAt||0)-Date.parse(a.publishedAt||0)).slice(0,35)};
  return {app:"MacroPulse",mode:"paper",liveExecution:false,startingBalance:PAPER_BALANCE,
   instruments:[{symbol:"XAUUSD",configuredLots:0.01,quote:bySymbol.XAUUSD||null,thesis:buildThesis("XAUUSD",bySymbol.XAUUSD,combinedNews,calendar,macro)},{symbol:"USOIL",configuredLots:0.1,quote:bySymbol.USOIL||null,thesis:buildThesis("USOIL",bySymbol.USOIL,combinedNews,calendar,macro)}],
   providers:{market:market.status,calendar:calendar.status,news:news.status,macro:macro.status,energy:energy.status,federalReserve:fed.status},
   calendar:{configured:calendar.status.configured,provider:calendar.status.provider,updatedAt:calendar.status.updatedAt,events:calendar.events,warning:calendar.status.error||null,attribution:calendar.attribution},
-  news,macro,
+  news,macro,energy,
   paper:{balance:PAPER_BALANCE,realizedPnl:0,positions:[],notes:["Paper ledger baseline only; no P/L simulation or persistent positions are connected yet."]},
   monitor:{target:"24/5",active:false,note:"Web app refreshes on demand; persistent 24/5 background worker and alerts are not connected."}};
 }
