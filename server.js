@@ -71,11 +71,12 @@ async function getEnergy(){
 async function getFedUpdates(){
  try{
   const xml=await getText("https://www.federalreserve.gov/feeds/press_all.xml");
-  const items=[...xml.matchAll(/<item>([\\s\\S]*?)<\\/item>/gi)].slice(0,20).map(m=>{
-   const block=m[1];
-   const field=(tag)=>{const x=block.match(new RegExp("<"+tag+"[^>]*>([\\s\\S]*?)<\\/"+tag+">","i"));return x?x[1].replace(/<!\\[CDATA\\[|\\]\\]>/g,"").replace(/&amp;/g,"&").replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&lt;/g,"<").replace(/&gt;/g,">").trim():null;};
+  const blocks=xml.split("<item>").slice(1).map(part=>part.split("</item>")[0]).slice(0,20);
+  const decode=(s)=>s.replace(/<!\[CDATA\[|\]\]>/g,"").replace(/&amp;/g,"&").replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&lt;/g,"<").replace(/&gt;/g,">").trim();
+  const items=blocks.map(block=>{
+   const field=(tag)=>{const match=block.match(new RegExp("<"+tag+"[^>]*>([\\s\\S]*?)</"+tag+">","i"));return match?decode(match[1]):null;};
    return {title:field("title"),url:field("link"),publishedAt:field("pubDate"),source:"Federal Reserve official RSS",sourceType:"official"};
-  }).filter(x=>x.title&&x.url);
+  }).filter(item=>item.title&&item.url);
   return {status:status("Federal Reserve official RSS",true,iso(),null),articles:items};
  }catch(e){return {status:status("Federal Reserve official RSS",true,null,e.message),articles:[]};}
 }
