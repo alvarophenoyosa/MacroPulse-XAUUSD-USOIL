@@ -42,18 +42,13 @@ async function getQuotes(){
  return {status:status("Twelve Data",true,iso(),results.some(x=>x.verified)?null:"Quote lookup failed; verify symbols/plan"),quotes:results};
 }
 async function getCalendar(){
- const key=process.env.TRADING_ECONOMICS_API_KEY;
- if(!key)return {status:status("Trading Economics",false,null,"API key required for verified actual/forecast/previous calendar"),events:[]};
+ const url="https://www.financecalendar.com/wp-json/fc/v1/calendar?country=US&impact=high&limit=100";
  try{
-  const d=await getJson("https://api.tradingeconomics.com/calendar?country=united%20states&importance=2,3&values=true&f=json",{Authorization:key});
-  if(!Array.isArray(d))throw new Error("unexpected_calendar_schema");
-  const now=Date.now();
-  const events=d.filter(e=>/CPI|consumer price|non.?farm|payroll|jobless|unemployment|federal funds|interest rate|FOMC|fed chair|crude oil inventories|API crude|EIA crude|OPEC|PCE|GDP|retail sales|PPI|ISM/i.test(String(e.Event||e.Category||"")))
-   .map(e=>({date:e.Date||null,country:e.Country||"United States",event:e.Event||e.Category||"Economic event",importance:Number(e.Importance)||null,actual:e.Actual??null,forecast:e.Forecast??null,previous:e.Previous??null,unit:e.Unit||"",currency:e.Currency||"",lastUpdate:e.LastUpdate||null,source:"Trading Economics",url:e.URL||null}))
-   .filter(e=>!e.date||!Number.isFinite(Date.parse(e.date))||Date.parse(e.date)>now-36*3600000)
-   .sort((a,b)=>Date.parse(a.date||0)-Date.parse(b.date||0)).slice(0,35);
-  return {status:status("Trading Economics",true,iso(),null),events};
- }catch(e){return {status:status("Trading Economics",true,null,e.message),events:[]};}
+  const d=await getJson(url);
+  if(!Array.isArray(d.events))throw new Error("unexpected_FinanceCalendar_schema");
+  const events=d.events.map(e=>({date:e.release_at_utc||e.time_utc||e.date||null,country:e.country||"US",event:e.name||e.title||"Economic event",importance:e.impact==="high"?3:e.impact==="medium"?2:1,actual:e.actual??null,forecast:e.consensus??null,previous:e.prior??null,unit:e.unit||"",currency:"USD",status:e.status||null,source:e.source_name||"Finance Calendar",sourceUrl:e.source_url||e.url||null,stale:!!e.data_stale}));
+  return {status:status("Finance Calendar",true,iso(),null),events,attribution:"Finance Calendar — https://www.financecalendar.com"};
+ }catch(e){return {status:status("Finance Calendar",true,null,e.message),events:[],attribution:"Finance Calendar — https://www.financecalendar.com"};}
 }
 async function getNews(){
  const query='(gold OR crude oil OR WTI OR OPEC OR "Federal Reserve" OR FOMC OR CPI OR inflation OR "nonfarm payrolls" OR "jobless claims" OR Treasury yields OR dollar)';
@@ -65,16 +60,13 @@ async function getNews(){
  }catch(e){return {status:status("GDELT news index",true,null,e.message),articles:[]};}
 }
 async function getEnergy(){
- const key=process.env.EIA_API_KEY;
- if(!key)return {status:status("US EIA",false,null,"API key required for official weekly crude inventory data"),latest:null,observations:[]};
+ const url="https://americasoilwatch.com/api/v1/us-stocks";
  try{
-  const url="https://api.eia.gov/v2/petroleum/stoc/wstk/data/?frequency=weekly&data%5B0%5D=value&facets%5Bduoarea%5D%5B0%5D=NUS&facets%5Bproduct%5D%5B0%5D=EPC0&facets%5Bprocess%5D%5B0%5D=SAE&sort%5B0%5D%5Bcolumn%5D=period&sort%5B0%5D%5Bdirection%5D=desc&length=8&api_key="+encodeURIComponent(key);
   const d=await getJson(url);
-  const rows=d?.response?.data;
-  if(!Array.isArray(rows))throw new Error("unexpected_EIA_schema");
-  const observations=rows.map(r=>({period:r.period,value:Number(r.value),units:r["units"]||"thousand barrels"}));
-  return {status:status("US EIA",true,iso(),null),latest:observations[0]||null,observations};
- }catch(e){return {status:status("US EIA",true,null,e.message),latest:null,observations:[]};}
+  const rows=Array.isArray(d)?d:(d.data||d.observations||d.results||[]);
+  if(!rows.length&&!Object.keys(d||{}).length)throw new Error("empty_AmericasOilWatch_response");
+  return {status:status("AmericasOilWatch",true,iso(),null),latest:d,observations:rows,source:"https://americasoilwatch.com/api/v1/us-stocks",attribution:"AmericasOilWatch"};
+ }catch(e){return {status:status("AmericasOilWatch",true,null,e.message),latest:null,observations:[],source:"https://americasoilwatch.com/api/v1/us-stocks"};}
 }
 async function getFedUpdates(){
  try{
@@ -144,7 +136,7 @@ async function overview(){
  return {app:"MacroPulse",mode:"paper",liveExecution:false,startingBalance:PAPER_BALANCE,
   instruments:[{symbol:"XAUUSD",configuredLots:0.01,quote:bySymbol.XAUUSD||null,thesis:buildThesis("XAUUSD",bySymbol.XAUUSD,combinedNews,calendar,macro)},{symbol:"USOIL",configuredLots:0.1,quote:bySymbol.USOIL||null,thesis:buildThesis("USOIL",bySymbol.USOIL,combinedNews,calendar,macro)}],
   providers:{market:market.status,calendar:calendar.status,news:news.status,macro:macro.status,energy:energy.status,federalReserve:fed.status},
-  calendar:{configured:calendar.status.configured,provider:calendar.status.provider,updatedAt:calendar.status.updatedAt,events:calendar.events,warning:calendar.status.error||(!calendar.status.configured?"Add TRADING_ECONOMICS_API_KEY to enable verified economic calendar.":null)},
+  calendar:{configured:calendar.status.configured,provider:calendar.status.provider,updatedAt:calendar.status.updatedAt,events:calendar.events,warning:calendar.status.error||null,attribution:calendar.attribution},
   news,macro,
   paper:{balance:PAPER_BALANCE,realizedPnl:0,positions:[],notes:["Paper ledger baseline only; no P/L simulation or persistent positions are connected yet."]},
   monitor:{target:"24/5",active:false,note:"Web app refreshes on demand; persistent 24/5 background worker and alerts are not connected."}};
