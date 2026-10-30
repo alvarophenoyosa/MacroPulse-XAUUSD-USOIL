@@ -29,14 +29,19 @@ async function getQuotes(){
   try{
    const [d,bars]=await Promise.all([
     getJson("https://api.twelvedata.com/quote?symbol="+encodeURIComponent(s.symbol)+"&apikey="+encodeURIComponent(key)),
-    getJson("https://api.twelvedata.com/time_series?symbol="+encodeURIComponent(s.symbol)+"&interval=1h&outputsize=12&apikey="+encodeURIComponent(key))
+    getJson("https://api.twelvedata.com/time_series?symbol="+encodeURIComponent(s.symbol)+"&interval=1h&outputsize=50&apikey="+encodeURIComponent(key))
    ]);
    if(d.status==="error"||!d.close)throw new Error(d.message||"quote_unavailable");
    const values=Array.isArray(bars.values)?bars.values.slice().reverse():[];
-   const last=values.length?Number(values[values.length-1].close):null;
-   const prior=values.length>4?Number(values[values.length-5].close):null;
-   const momentumPct=last>0&&prior>0?((last-prior)/prior)*100:null;
-   return {symbol:s.display,providerSymbol:s.symbol,asset:s.asset,price:Number(d.close),open:Number(d.open)||null,high:Number(d.high)||null,low:Number(d.low)||null,change:Number(d.change)||null,percentChange:Number(d.percent_change)||null,datetime:d.datetime||d.timestamp||null,momentumPct:Number.isFinite(momentumPct)?momentumPct:null,momentumWindow:"approximately 4 hourly candles",candleTime:values.length?values[values.length-1].datetime:null,source:"Twelve Data",verified:true};
+   const candles=values.map(v=>({time:v.datetime,open:Number(v.open),high:Number(v.high),low:Number(v.low),close:Number(v.close),volume:Number(v.volume)||null})).filter(v=>[v.open,v.high,v.low,v.close].every(Number.isFinite));
+   const closes=candles.map(v=>v.close), last=closes.at(-1), prior4=closes.length>4?closes.at(-5):null, prior12=closes.length>12?closes.at(-13):null;
+   const momentumPct=last>0&&prior4>0?((last-prior4)/prior4)*100:null;
+   const momentum12hPct=last>0&&prior12>0?((last-prior12)/prior12)*100:null;
+   const ema=(period)=>{if(closes.length<period)return null;const k=2/(period+1);let value=closes.slice(0,period).reduce((a,b)=>a+b,0)/period;for(const price of closes.slice(period))value=price*k+value*(1-k);return value;};
+   const tr=candles.slice(1).map((v,i)=>Math.max(v.high-v.low,Math.abs(v.high-candles[i].close),Math.abs(v.low-candles[i].close)));
+   const atr=tr.length>=14?tr.slice(-14).reduce((a,b)=>a+b,0)/14:null;
+   const ema9=ema(9),ema21=ema(21);
+   return {symbol:s.display,providerSymbol:s.symbol,asset:s.asset,price:Number(d.close),open:Number(d.open)||null,high:Number(d.high)||null,low:Number(d.low)||null,change:Number(d.change)||null,percentChange:Number(d.percent_change)||null,datetime:d.datetime||d.timestamp||null,momentumPct:Number.isFinite(momentumPct)?momentumPct:null,momentum12hPct:Number.isFinite(momentum12hPct)?momentum12hPct:null,ema9,ema21,atr14:atr,trend:ema9&&ema21?(ema9>ema21?"UP":ema9<ema21?"DOWN":"FLAT"):"UNKNOWN",candleCount:candles.length,candles,candleTime:candles.at(-1)?.time||null,momentumWindow:"4 hourly candles; trend from EMA 9/21",source:"Twelve Data",verified:true};
   }catch(e){return {symbol:s.display,asset:s.asset,verified:false,error:e.message};}
  }));
  return {status:status("Twelve Data",true,iso(),results.some(x=>x.verified)?null:"Quote lookup failed; verify symbols/plan"),quotes:results};
@@ -95,48 +100,57 @@ async function getMacroSeries(){
   return {status:status("FRED public series",true,iso(),null),data:latest,disclaimer:"FRED values are daily/periodic and can be delayed; not tick-level live prices."};
  }catch(e){return {status:status("FRED public series",true,null,e.message),data:{},disclaimer:"Macro series unavailable."};}
 }
-function buildThesis(symbol,quote,news,calendar,macro){
- const gold=symbol==="XAUUSD", reasons=[],risks=[];
+function buildThesis(symbol,quote,news,calendar,macro,energy){
+ const gold=symbol==="XAUUSD",reasons=[],risks=[],scores={technical:0,macro:0,news:0,energy:0};
  const priceOK=!!quote?.verified&&Number.isFinite(quote.price);
- if(!priceOK)reasons.push("Live quote unavailable or not verified.");
- else reasons.push("Latest reference quote: "+quote.price+" ("+quote.providerSymbol+"); source timestamp: "+(quote.datetime||"not supplied")+".");
- const headlines=(news.articles||[]).slice(0,20).map(a=>a.title.toLowerCase());
- const goldUp=/gold (rall|surge|rise|gain)|safe.?haven|rate cut|dovish|yield(s)? fall|dollar weak|weak dollar/;
- const goldDown=/gold (drop|fall|slide|sink)|hawkish|rate hike|yield(s)? rise|dollar surge|strong dollar/;
- const oilUp=/oil (surge|rise|gain|jump)|supply cut|opec.{0,25}(cut|reduce)|inventory draw|crude stocks fall|supply disruption/;
- const oilDown=/oil (drop|fall|slide|sink)|opec.{0,25}(increase|raise)|inventory build|crude stocks rise|demand concerns/;
- const up=gold?goldUp:oilUp, down=gold?goldDown:oilDown;
- let upCount=0,downCount=0;
- for(const h of headlines){if(up.test(h))upCount++;if(down.test(h))downCount++;}
- if(upCount||downCount)reasons.push("Headline keyword scan: "+upCount+" bullish-context and "+downCount+" bearish-context matches; headlines are context, not verified causal signals.");
- else reasons.push("No clear directional headline keyword cluster; do not infer direction from absence of news.");
- if(gold&&macro.data?.DFII10)reasons.push("Latest 10Y TIPS real yield: "+macro.data.DFII10.value+"% ("+macro.data.DFII10.date+").");
- if(gold&&macro.data?.DTWEXBGS)reasons.push("Broad dollar index: "+macro.data.DTWEXBGS.value+" ("+macro.data.DTWEXBGS.date+").");
- if(gold&&macro.data?.DGS10)reasons.push("10Y Treasury yield: "+macro.data.DGS10.value+"% ("+macro.data.DGS10.date+").");
- if(!gold&&macro.data?.DCOILWTICO)reasons.push("FRED WTI series: "+macro.data.DCOILWTICO.value+" ("+macro.data.DCOILWTICO.date+"); daily reference, not Exness CFD quote.");
- const highImpact=(calendar.events||[]).filter(e=>e.importance>=2);
- if(highImpact.length)reasons.push(highImpact.length+" high/medium-importance macro events in provider response; check exact release time before any simulated decision.");
- risks.push("GDELT headline keyword scan is not a trained sentiment model and can misread context.");
- risks.push("FRED macro series are not tick-level live and may be delayed.");
- risks.push("Reference feed symbols may differ from Exness CFD pricing/spread.");
- risks.push("No verified cross-source post-event confirmation, order book, broker contract spec or backtested edge yet.");
- const feedReady=priceOK&&news.status.available&&calendar.status.available;
- const momentum=Number(quote?.momentumPct);
- let direction="WAIT",confidence=0;
- if(feedReady&&Number.isFinite(momentum)&&Math.abs(momentum)>=0.08&&upCount+downCount>=2&&upCount!==downCount){
-  const momentumUp=momentum>0;
-  const newsUp=upCount>downCount;
-  if(momentumUp===newsUp){direction=momentumUp?"BULLISH WATCH":"BEARISH WATCH";confidence=55;}
+ const age=quote?.datetime?Date.now()-Date.parse(quote.datetime):Infinity;
+ const fresh=Number.isFinite(age)&&age>=-300000&&age<=90*60000;
+ if(!priceOK)reasons.push("No verified quote; signal blocked.");
+ else if(!fresh)reasons.push("Quote timestamp is missing or older than 90 minutes; signal blocked.");
+ else reasons.push("Fresh reference quote: "+quote.price+" from "+quote.providerSymbol+".");
+ const momentum=Number(quote?.momentumPct), momentum12=Number(quote?.momentum12hPct);
+ if(priceOK&&fresh&&quote.trend==="UP"&&momentum>0&&momentum12>0)scores.technical=35;
+ else if(priceOK&&fresh&&quote.trend==="DOWN"&&momentum<0&&momentum12<0)scores.technical=35;
+ else if(priceOK&&fresh&&quote.trend!=="UNKNOWN"&&Number.isFinite(momentum)&&Math.abs(momentum)>=0.04)scores.technical=15;
+ reasons.push("Technical: EMA 9/21 "+(quote?.trend||"unavailable")+", 4h momentum "+(Number.isFinite(momentum)?momentum.toFixed(3)+"%":"n/a")+", 12h momentum "+(Number.isFinite(momentum12)?momentum12.toFixed(3)+"%":"n/a")+".");
+ const headlines=(news.articles||[]).filter(a=>a.title).slice(0,35);
+ const upRe=gold?/(gold.{0,25}(rall|surge|rise|gain)|safe.?haven|rate cut|dovish|real yields? fall|dollar weak|weak dollar)/i:/(oil.{0,25}(surge|rise|gain|jump)|supply cut|opec.{0,35}(cut|reduce)|inventory draw|crude stocks fall|supply disruption)/i;
+ const downRe=gold?/(gold.{0,25}(drop|fall|slide|sink)|hawkish|rate hike|real yields? rise|dollar surge|strong dollar)/i:/(oil.{0,25}(drop|fall|slide|sink)|opec.{0,35}(increase|raise)|inventory build|crude stocks rise|demand concerns)/i;
+ const upHits=headlines.filter(a=>upRe.test(a.title)).length,downHits=headlines.filter(a=>downRe.test(a.title)).length;
+ if(upHits>=2&&upHits>downHits)scores.news=15;
+ else if(downHits>=2&&downHits>upHits)scores.news=15;
+ reasons.push("News context: "+upHits+" bullish-keyword and "+downHits+" bearish-keyword headlines; keyword matches are weak evidence.");
+ const real=macro.data?.DFII10,usd=macro.data?.DTWEXBGS;
+ if(gold){
+  if(real?.change!==null&&real?.change!==undefined)scores.macro+=(real.change<0?15:real.change>0?0:5);
+  if(usd?.change!==null&&usd?.change!==undefined)scores.macro+=(usd.change<0?15:usd.change>0?0:5);
+  if(real)reasons.push("10Y real yield "+real.value+"%, daily change "+real.change+".");
+  if(usd)reasons.push("Broad USD index "+usd.value+", daily change "+usd.change+".");
+ }else{
+  reasons.push("Oil inventory feed is displayed for review but not auto-scored until its schema and release deltas are normalized.");
+  if(macro.data?.DCOILWTICO)reasons.push("FRED WTI daily reference "+macro.data.DCOILWTICO.value+" ("+macro.data.DCOILWTICO.date+").");
  }
- if(Number.isFinite(momentum))reasons.push("Hourly reference-price momentum: "+momentum.toFixed(3)+"% over "+(quote.momentumWindow||"recent candles")+"; not an entry signal by itself.");
- return {instrument:symbol,direction,confidence,horizon:"multi-day",dataReady:feedReady,generatedAt:iso(),reasons,risks,headlineContext:{bullishMatches:upCount,bearishMatches:downCount},note:"Watch bias is a basic keyword-plus-momentum filter, not validated AI. No orders or automatic entries are sent; WAIT remains the default unless independent feeds align."};
+ const upcoming=(calendar.events||[]).filter(e=>e.date&&String(e.date).includes("T")).map(e=>({...e,mins:(Date.parse(e.date)-Date.now())/60000})).filter(e=>e.mins>=0&&e.mins<=45&&e.importance>=2);
+ const eventBlock=upcoming.length>0;
+ if(eventBlock)reasons.push("High/medium-impact US release within 45 minutes: "+upcoming.map(e=>e.event).join(", ")+". Stand aside.");
+ const aligned=quote?.trend==="UP"&&momentum>0&&momentum12>0?"BUY":quote?.trend==="DOWN"&&momentum<0&&momentum12<0?"SELL":"";
+ const total=scores.technical+scores.macro+scores.news+scores.energy;
+ const dataReady=priceOK&&fresh&&news.status.available&&macro.status.available&&calendar.status.available;
+ let direction="NO TRADE",setup=null;
+ if(dataReady&&!eventBlock&&aligned&&scores.technical>=35&&total>=55){direction="PAPER "+aligned;setup=aligned;}
+ else if(dataReady&&!eventBlock&&scores.technical>=15)direction="WATCH";
+ risks.push("Rule-based research score only; not trained, backtested or validated.");
+ risks.push("Twelve Data spot references may differ from Exness CFD pricing, contract size and spread.");
+ risks.push("News keyword matches can be false positives; FRED macro data is delayed/daily.");
+ risks.push("No order book, broker spread or verified oil inventory surprise is included.");
+ return {instrument:symbol,direction,setup,confidence:Math.min(100,total),score:total,scoreBreakdown:scores,horizon:"multi-day",dataReady,generatedAt:iso(),reasons,risks,eventBlocked:eventBlock,headlineContext:{bullishMatches:upHits,bearishMatches:downHits},note:"PAPER labels are research signals only. No position is opened and no broker order is sent. Missing/stale data blocks signals."};
 }
 async function overview(){
  const [market,calendar,news,macro,energy,fed]=await Promise.all([getQuotes(),getCalendar(),getNews(),getMacroSeries(),getEnergy(),getFedUpdates()]);
  const bySymbol=Object.fromEntries(market.quotes.map(q=>[q.symbol,q]));
  const combinedNews={...news,articles:[...(fed.articles||[]),...(news.articles||[])].sort((a,b)=>Date.parse(b.publishedAt||0)-Date.parse(a.publishedAt||0)).slice(0,35)};
  return {app:"MacroPulse",mode:"paper",liveExecution:false,startingBalance:PAPER_BALANCE,
-  instruments:[{symbol:"XAUUSD",configuredLots:0.01,quote:bySymbol.XAUUSD||null,thesis:buildThesis("XAUUSD",bySymbol.XAUUSD,combinedNews,calendar,macro)},{symbol:"USOIL",configuredLots:0.1,quote:bySymbol.USOIL||null,thesis:buildThesis("USOIL",bySymbol.USOIL,combinedNews,calendar,macro)}],
+  instruments:[{symbol:"XAUUSD",configuredLots:0.01,quote:bySymbol.XAUUSD||null,thesis:buildThesis("XAUUSD",bySymbol.XAUUSD,combinedNews,calendar,macro,energy)},{symbol:"USOIL",configuredLots:0.1,quote:bySymbol.USOIL||null,thesis:buildThesis("USOIL",bySymbol.USOIL,combinedNews,calendar,macro,energy)}],
   providers:{market:market.status,calendar:calendar.status,news:news.status,macro:macro.status,energy:energy.status,federalReserve:fed.status},
   calendar:{configured:calendar.status.configured,provider:calendar.status.provider,updatedAt:calendar.status.updatedAt,events:calendar.events,warning:calendar.status.error||null,attribution:calendar.attribution},
   news,macro,energy,
